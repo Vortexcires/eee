@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Rubik's Cube — Auto-solver (Robust)</title>
+<style>
+  html,body { height:100%; margin:0; background:#0b0b0b; color:#eee; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+  #wrap { position:relative; width:100%; height:100vh; overflow:hidden; }
+  canvas { display:block; }
+  #ui { position:absolute; left:12px; top:12px; z-index:20; display:flex; gap:8px; flex-wrap:wrap; }
+  button { background:#222; color:#eee; border:1px solid #444; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
+  button:hover { background:#333; }
+  #title { position:absolute; left:50%; transform:translateX(-50%); top:12px; z-index:20; padding:6px 10px; border-radius:8px; background:rgba(0,0,0,0.7); color:#fff; font-weight:700; }
+  #info { position:absolute; right:12px; top:12px; z-index:20; background: rgba(0,0,0,0.7); padding:8px 12px; border-radius:8px; font-size:13px; color:#ddd; width:220px; max-height:60vh; overflow:auto; }
+  #movesList { font-family:monospace; font-size:13px; color:#ddd; margin-top:6px; max-height:200px; overflow:auto; }
+  #errorBox { position: absolute; right:12px; bottom:12px; z-index:999; background:rgba(128,0,0,0.92); color:#fff; padding:10px; border-radius:8px; max-width:420px; display:none; white-space:pre-wrap; font-family:monospace; font-size:12px; }
+</style>
+</head>
+<body>
+<div id="wrap"></div>
+
+<div id="ui">
+  <button id="scrambleBtn">Scramble</button>
+  <button id="solveBtn">Solve</button>
+  <button id="randBtn">Random Move</button>
+  <button id="resetBtn">Reset</button>
+</div>
+
+<div id="title">3D Rubik's Cube — Auto-solver</div>
+
+<div id="info">
+  <div><strong>Controls</strong></div>
+  <div>Mouse: orbit / pan / zoom</div>
+  <div>Keys: U D L R F B (Shift for ', Alt for 2)</div>
+  <div>Space = scramble, S = solve</div>
+  <div style="margin-top:6px"><strong>Moves recorded</strong></div>
+  <div id="movesList">(none)</div>
+</div>
+
+<div id="errorBox"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+(function(){
+
+  const errorBox = document.getElementById('errorBox');
+  function showError(err) {
+    errorBox.style.display = 'block';
+    errorBox.textContent = String(err);
+    console.error(err);
+  }
+  window.addEventListener('error', function(e){ showError(e.message + '\n' + (e.error && e.error.stack ? e.error.stack : '') ); });
+  window.addEventListener('unhandledrejection', function(e){ showError('UnhandledRejection: ' + (e.reason && e.reason.stack ? e.reason.stack : JSON.stringify(e.reason))); });
+
+  const container = document.getElementById('wrap');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0b0b);
+
+  const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 200);
+  camera.position.set(6,6,6);
+  camera.lookAt(0,0,0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  container.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.set(0,0,0);
+
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x111111, 0.9);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+  dir.position.set(5,10,7);
+  scene.add(dir);
+
+  const grid = new THREE.GridHelper(14, 14, 0x222222, 0x111111);
+  grid.material.opacity = 0.06;
+  grid.material.transparent = true;
+  scene.add(grid);
+
+  const GAP = 0.06;
+  const CUBELET_SIZE = 0.98;
+  const SPACING = CUBELET_SIZE + GAP;
+  const positions = [-1,0,1];
+  const cubelets = [];
+  const cubeGroup = new THREE.Group();
+  scene.add(cubeGroup);
+
+  const COLORS = {
+    U: 0xffffff,  // White - top
+    D: 0xffff00,  // Yellow - bottom
+    F: 0x00ff00,  // Green - front
+    B: 0x0066ff,  // Blue - back
+    R: 0xff0000,  // Red - right
+    L: 0xff8800,  // Orange - left
+    NONE: 0x1a1a1a
+  };
+
+  function faceColorForCubelet(x,y,z) {
+    return [
+      x === 1 ? COLORS.R : COLORS.NONE,
+      x === -1 ? COLORS.L : COLORS.NONE,
+      y === 1 ? COLORS.U : COLORS.NONE,
+      y === -1 ? COLORS.D : COLORS.NONE,
+      z === 1 ? COLORS.F : COLORS.NONE,
+      z === -1 ? COLORS.B : COLORS.NONE
+    ];
+  }
+
+  const geom = new THREE.BoxGeometry(CUBELET_SIZE, CUBELET_SIZE, CUBELET_SIZE);
+  for (let xi of positions) {
+    for (let yi of positions) {
+      for (let zi of positions) {
+        const mats = faceColorForCubelet(xi, yi, zi).map(c => new THREE.MeshStandardMaterial({
+          color: c,
+          metalness: 0.05,
+          roughness: 0.35
+        }));
+        const mesh = new THREE.Mesh(geom, mats);
+        mesh.position.set(xi*SPACING, yi*SPACING, zi*SPACING);
+        mesh.userData = { coords: { x:xi, y:yi, z:zi } };
+        cubeGroup.add(mesh);
+        cubelets.push(mesh);
+      }
+    }
+  }
+
+  const movesListNode = document.getElementById('movesList');
+  function updateMoveListUI(){
+    if (!recordedMoves.length) { movesListNode.textContent = "(none)"; return; }
+    movesListNode.innerHTML = recordedMoves.map((m,i)=> (i+1)+': '+m ).join('<br>');
+  }
+
+  let recordedMoves = [];
+  let moveQueue = [];
+  let busy = false;
+
+  const faceDefs = {
+    U: {axis:'y', layer: 1},
+    D: {axis:'y', layer: -1},
+    L: {axis:'x', layer: -1},
+    R: {axis:'x', layer: 1},
+    F: {axis:'z', layer: 1},
+    B: {axis:'z', layer: -1}
+  };
+
+  function enqueueMove(moveStr, record=true){
+    if (record) recordedMoves.push(moveStr);
+    moveQueue.push(moveStr);
+    updateMoveListUI();
+    if (!busy) runQueue();
+  }
+
+  function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  function parseMove(moveStr){
+    const face = moveStr[0];
+    let suffix = moveStr.slice(1);
+    let turns = 1;
+    if (suffix === "2") turns = 2;
+    if (suffix === "'") turns = -1;
+    return { face, turns };
+  }
+
+  function getLayer(face){
+    const def = faceDefs[face];
+    const axis = def.axis;
+    const val = def.layer * SPACING;
+    const eps = SPACING/2 + 0.02;
+    return cubelets.filter(c => Math.abs(c.position[axis] - val) < eps);
+  }
+
+  function reparentPreserveWorld(child, newParent){
+    child.updateMatrixWorld(true);
+    newParent.updateMatrixWorld(true);
+    const mWorld = child.matrixWorld.clone();
+    const invParent = new THREE.Matrix4().copy(newParent.matrixWorld).invert();
+    const mLocal = new THREE.Matrix4().multiplyMatrices(invParent, mWorld);
+    const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
+    mLocal.decompose(pos, quat, scl);
+    newParent.add(child);
+    child.position.copy(pos);
+    child.quaternion.copy(quat);
+    child.scale.copy(scl);
+    child.updateMatrix();
+    child.updateMatrixWorld(true);
+  }
+
+  function snapCubelet(mesh){
+    const x = Math.round(mesh.position.x / SPACING);
+    const y = Math.round(mesh.position.y / SPACING);
+    const z = Math.round(mesh.position.z / SPACING);
+    mesh.position.set(x*SPACING, y*SPACING, z*SPACING);
+    mesh.userData.coords = { x,y,z };
+    const e = new THREE.Euler().setFromQuaternion(mesh.quaternion, "XYZ");
+    function snapAngle(a){ return THREE.MathUtils.degToRad(Math.round(THREE.MathUtils.radToDeg(a)/90)*90); }
+    e.x = snapAngle(e.x); e.y = snapAngle(e.y); e.z = snapAngle(e.z);
+    mesh.quaternion.setFromEuler(e);
+    mesh.updateMatrix();
+    mesh.updateMatrixWorld(true);
+  }
+
+  function animateMove(moveStr){
+    return new Promise(async (resolve) => {
+      const {face, turns} = parseMove(moveStr);
+      const layer = getLayer(face);
+      const group = new THREE.Group();
+      scene.add(group);
+
+      layer.forEach(c => reparentPreserveWorld(c, group));
+
+      let axisVec = new THREE.Vector3();
+      if (faceDefs[face].axis === 'x') axisVec.set(1,0,0);
+      if (faceDefs[face].axis === 'y') axisVec.set(0,1,0);
+      if (faceDefs[face].axis === 'z') axisVec.set(0,0,1);
+
+      const faceSign = { U:-1, D:1, L:1, R:-1, F:-1, B:1 };
+      const sign = faceSign[face] || 1;
+      const quarter = Math.PI/2;
+      const targetAngle = quarter * Math.abs(turns) * Math.sign(turns) * sign;
+
+      const duration = 200 * Math.abs(turns);
+      const start = performance.now();
+
+      function step(now){
+        const t = Math.min(1, (now - start)/duration);
+        const eased = t<0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2;
+        group.rotation.setFromVector3(axisVec.clone().multiplyScalar(eased*targetAngle));
+        if (t < 1) requestAnimationFrame(step);
+        else {
+          group.updateMatrixWorld(true);
+          const children = [...group.children];
+          children.forEach(c => {
+            c.updateMatrixWorld(true);
+            const mWorld = c.matrixWorld.clone();
+            const invParent = new THREE.Matrix4().copy(cubeGroup.matrixWorld).invert();
+            const mLocal = new THREE.Matrix4().multiplyMatrices(invParent, mWorld);
+            const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
+            mLocal.decompose(pos, quat, scl);
+            cubeGroup.add(c);
+            c.position.copy(pos);
+            c.quaternion.copy(quat);
+            c.scale.copy(scl);
+            snapCubelet(c);
+          });
+          scene.remove(group);
+          resolve();
+        }
+      }
+      requestAnimationFrame(step);
+    });
+  }
+
+  async function runQueue(){
+    busy = true;
+    while (moveQueue.length){
+      const m = moveQueue.shift();
+      await animateMove(m);
+      await wait(80);
+    }
+    busy = false;
+  }
+
+  function applyMoveString(moveStr, record=true){
+    enqueueMove(moveStr, record);
+  }
+
+  function invertMove(m){
+    if (m.endsWith("2")) return m;
+    if (m.endsWith("'")) return m.slice(0,1);
+    return m + "'";
+  }
+
+  function scrambleRandom(count=20){
+    if (busy) return;
+    recordedMoves = [];
+    moveQueue = [];
+    const choices = ['U','D','L','R','F','B'];
+    let last = null;
+    const seq = [];
+    for (let i=0;i<count;i++){
+      let face = choices[Math.floor(Math.random()*choices.length)];
+      if (face === last){ i--; continue; }
+      last = face;
+      const r = Math.random();
+      let suffix = "";
+      if (r < 0.15) suffix = "2";
+      else if (r < 0.5) suffix = "'";
+      seq.push(face + suffix);
+    }
+    seq.forEach(m => enqueueMove(m, true));
+  }
+
+  function solve(){
+    if (busy) return;
+    if (!recordedMoves.length) return;
+    const snapshot = recordedMoves.slice();
+    const reversed = snapshot.slice().reverse().map(invertMove);
+    recordedMoves = [];
+    updateMoveListUI();
+    reversed.forEach(m => moveQueue.push(m));
+    runQueue();
+  }
+
+  function resetCubeInstant(){
+    moveQueue = [];
+    recordedMoves = [];
+    updateMoveListUI();
+    cubelets.forEach(c => {
+      const coords = c.userData.coords;
+      c.position.set(coords.x * SPACING, coords.y * SPACING, coords.z * SPACING);
+      c.rotation.set(0,0,0);
+      c.quaternion.set(0,0,0,1);
+      snapCubelet(c);
+      if (c.parent !== cubeGroup) cubeGroup.add(c);
+    });
+  }
+
+  function randomSingleMove(){
+    const faces = ['U','D','L','R','F','B'];
+    const f = faces[Math.floor(Math.random()*faces.length)];
+    const r = Math.random();
+    let suffix = "";
+    if (r < 0.15) suffix = "2";
+    else if (r < 0.55) suffix = "'";
+    applyMoveString(f + suffix, true);
+  }
+
+  document.getElementById('scrambleBtn').addEventListener('click', ()=> scrambleRandom(20));
+  document.getElementById('solveBtn').addEventListener('click', ()=> solve());
+  document.getElementById('randBtn').addEventListener('click', ()=> randomSingleMove());
+  document.getElementById('resetBtn').addEventListener('click', ()=> { if (!busy) resetCubeInstant(); });
+
+  window.addEventListener('keydown', (e) => {
+    const key = e.key.toUpperCase();
+    if (['U','D','L','R','F','B'].includes(key)){
+      let suffix = "";
+      if (e.shiftKey) suffix = "'";
+      if (e.altKey || e.key === '2') suffix = "2";
+      applyMoveString(key + suffix, true);
+    }
+    if (e.code === 'Space'){ e.preventDefault(); scrambleRandom(20); }
+    if (e.key.toLowerCase() === 's'){ solve(); }
+  });
+
+  function animate(){
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  cubelets.forEach(c => snapCubelet(c));
+  updateMoveListUI();
+
+  console.log("Rubik's cube ready. Use Scramble -> Solve. Keyboard: U D L R F B (Shift for prime, Alt/2 for double). Space = scramble, S = solve.");
+  
+  window.addEventListener('resize', ()=> {
+    camera.aspect = container.clientWidth / container.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(container.clientWidth, container.clientHeight);
+  });
+
+})();
+</script>
+</body>
+</html>
