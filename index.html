@@ -3,18 +3,21 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Rubik's Cube — Auto-solver (Robust)</title>
+<title>Rubik's Cube — Robust Solver + Reset Fix (perf tuned)</title>
 <style>
-  html,body { height:100%; margin:0; background:#0b0b0b; color:#eee; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
-  #wrap { position:relative; width:100%; height:100vh; overflow:hidden; }
-  canvas { display:block; }
-  #ui { position:absolute; left:12px; top:12px; z-index:20; display:flex; gap:8px; flex-wrap:wrap; }
-  button { background:#222; color:#eee; border:1px solid #444; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
-  button:hover { background:#333; }
-  #title { position:absolute; left:50%; transform:translateX(-50%); top:12px; z-index:20; padding:6px 10px; border-radius:8px; background:rgba(0,0,0,0.7); color:#fff; font-weight:700; }
-  #info { position:absolute; right:12px; top:12px; z-index:20; background: rgba(0,0,0,0.7); padding:8px 12px; border-radius:8px; font-size:13px; color:#ddd; width:220px; max-height:60vh; overflow:auto; }
-  #movesList { font-family:monospace; font-size:13px; color:#ddd; margin-top:6px; max-height:200px; overflow:auto; }
-  #errorBox { position: absolute; right:12px; bottom:12px; z-index:999; background:rgba(128,0,0,0.92); color:#fff; padding:10px; border-radius:8px; max-width:420px; display:none; white-space:pre-wrap; font-family:monospace; font-size:12px; }
+  html,body{height:100%;margin:0;background:#0b0b0b;color:#eee;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  #wrap{position:relative;width:100%;height:100vh;overflow:hidden}
+  canvas{display:block}
+  #ui{position:absolute;left:12px;top:12px;z-index:40;display:flex;gap:8px;flex-wrap:wrap}
+  button{background:#222;color:#eee;border:1px solid #444;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:600}
+  button:hover{background:#2b2b2b}
+  #title{position:absolute;left:50%;transform:translateX(-50%);top:12px;z-index:40;padding:6px 10px;border-radius:8px;background:rgba(0,0,0,0.65);font-weight:700}
+  #info{position:absolute;right:12px;top:12px;z-index:40;background:rgba(0,0,0,0.65);padding:10px;border-radius:8px;font-size:13px;color:#ddd;width:320px;max-height:70vh;overflow:auto}
+  #movesList{font-family:monospace;font-size:13px;color:#ddd;margin-top:6px;max-height:240px;overflow:auto}
+  #status{margin-top:8px;font-size:13px;color:#bcd}
+  #errorBox{position:absolute;right:12px;bottom:12px;z-index:9999;background:rgba(192,0,0,0.95);color:#fff;padding:10px;border-radius:8px;max-width:540px;display:none;white-space:pre-wrap;font-family:monospace;font-size:12px}
+  .small{padding:6px 8px;font-size:13px}
+  .hint{font-size:12px;color:#9aa}
 </style>
 </head>
 <body>
@@ -23,168 +26,194 @@
 <div id="ui">
   <button id="scrambleBtn">Scramble</button>
   <button id="solveBtn">Solve</button>
-  <button id="randBtn">Random Move</button>
-  <button id="resetBtn">Reset</button>
+  <button id="randBtn" class="small">Random Move</button>
+  <button id="resetBtn" class="small">Reset</button>
+  <button id="scanBtn" class="small">Read Visual State</button>
 </div>
 
-<div id="title">3D Rubik's Cube — Auto-solver</div>
+<div id="title">3D Rubik's Cube — Robust Solver + Reset Fix</div>
 
 <div id="info">
   <div><strong>Controls</strong></div>
-  <div>Mouse: orbit / pan / zoom</div>
-  <div>Keys: U D L R F B (Shift for ', Alt for 2)</div>
-  <div>Space = scramble, S = solve</div>
-  <div style="margin-top:6px"><strong>Moves recorded</strong></div>
+  <div>Left-drag: orbit — Right-drag / middle-drag: pan — Wheel: zoom</div>
+  <div class="hint">(touch: drag to orbit, two-finger pan)</div>
+  <div style="margin-top:8px"><strong>Moves recorded</strong></div>
   <div id="movesList">(none)</div>
+  <div id="status">Solver: <span id="solverState">loading...</span></div>
+  <div style="margin-top:8px;font-size:12px;color:#aaa">If real solver unavailable the app will reverse recorded moves when you hit Solve (works when cube was scrambled via UI).</div>
 </div>
 
 <div id="errorBox"></div>
 
-<script type="importmap">
-{
-  "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
-  }
-}
-</script>
+<!-- Three (non-module) -->
+<script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
 
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+<!-- Try cubejs from npm CDN (this version usually exposes the classic API) -->
+<script src="https://cdn.jsdelivr.net/npm/cubejs@1.3.2/lib/cube.min.js"></script>
+
+<script>
+/* Robust single-file rubik's cube:
+   - Recreates cube on reset (fixes orphaned rotation artifacts)
+   - Tries to use cube.js solver; if incompatible, falls back to reversing recordedMoves
+   - Read Visual State to load a facelet string into modelCube if cube.js is present
+   - Perf tuned: MeshBasicMaterial, capped pixel ratio, smaller animation cost
+*/
 
 (function(){
-
+  // --- error UI ---
   const errorBox = document.getElementById('errorBox');
-  function showError(err) {
+  function showError(err){
     errorBox.style.display = 'block';
-    errorBox.textContent = String(err);
+    errorBox.textContent = typeof err === 'string' ? err : (err && err.stack ? err.stack : String(err));
     console.error(err);
   }
-  window.addEventListener('error', function(e){ showError(e.message + '\n' + (e.error && e.error.stack ? e.error.stack : '') ); });
-  window.addEventListener('unhandledrejection', function(e){ showError('UnhandledRejection: ' + (e.reason && e.reason.stack ? e.reason.stack : JSON.stringify(e.reason))); });
+  window.addEventListener('error', e => showError(e.message + '\n' + (e.error && e.error.stack ? e.error.stack : '')));
+  window.addEventListener('unhandledrejection', e => showError('UnhandledRejection: ' + (e.reason && e.reason.stack ? e.reason.stack : JSON.stringify(e.reason))));
 
+  if (typeof THREE === 'undefined') { showError('three.min.js did not load'); return; }
+
+  // --- Minimal controls (orbit/pan/zoom) ---
+  class SimpleControls {
+    constructor(camera, dom) {
+      this.camera = camera; this.dom = dom;
+      this.target = new THREE.Vector3(0,0,0);
+      this.enableDamping = true; this.dampingFactor = 0.08;
+      // spherical from camera
+      this._offset = new THREE.Vector3().copy(camera.position).sub(this.target);
+      this.spherical = new THREE.Spherical().setFromVector3(this._offset);
+      this.targetSpherical = this.spherical.clone();
+      this.targetRadius = this.spherical.radius;
+      this.minDistance = 2; this.maxDistance = 50;
+      this.rotateSpeed = 1.0; this.panSpeed = 1.0; this.zoomSpeed = 1.0;
+      this.state = 'none';
+      this.pointerLast = new THREE.Vector2();
+      this._bind();
+    }
+    _bind(){
+      const dom = this.dom;
+      dom.style.touchAction = 'none';
+      dom.addEventListener('pointerdown', this._down = (e)=>{ dom.setPointerCapture?.(e.pointerId); this.pointerLast.set(e.clientX,e.clientY); this.state = (e.button===0 ? 'rotate' : 'pan'); }, {passive:false});
+      window.addEventListener('pointermove', this._move = (e)=>{ if(this.state==='none') return; const dx = e.clientX - this.pointerLast.x, dy = e.clientY - this.pointerLast.y; this.pointerLast.set(e.clientX,e.clientY); if(this.state==='rotate'){ const rotX = (2*Math.PI*dx/dom.clientWidth)*this.rotateSpeed; const rotY = (2*Math.PI*dy/dom.clientHeight)*this.rotateSpeed; this.targetSpherical.theta -= rotX; this.targetSpherical.phi -= rotY; const EPS=0.0001; this.targetSpherical.phi = Math.max(EPS, Math.min(Math.PI-EPS, this.targetSpherical.phi)); } else { const cam=this.camera; const distance=this.targetSpherical.radius; const fov = cam.fov * (Math.PI/180); const height = 2*Math.tan(fov/2)*distance; const width = height*cam.aspect; const ndx = -dx/dom.clientWidth*width*this.panSpeed; const ndy = dy/dom.clientHeight*height*this.panSpeed; const matrix = new THREE.Matrix4().extractRotation(cam.matrixWorld); const camRight = new THREE.Vector3(1,0,0).applyMatrix4(matrix); const camUp = new THREE.Vector3(0,1,0).applyMatrix4(matrix); this.target.add(camRight.multiplyScalar(ndx)); this.target.add(camUp.multiplyScalar(ndy)); } e.preventDefault(); }, {passive:false});
+      window.addEventListener('pointerup', this._up=(e)=>{ dom.releasePointerCapture?.(e.pointerId); this.state='none'; });
+      dom.addEventListener('wheel', this._wheel=(e)=>{ this.targetRadius += (e.deltaY>0?1:-1)*0.4*this.zoomSpeed; this.targetRadius = Math.max(this.minDistance, Math.min(this.maxDistance, this.targetRadius)); e.preventDefault(); }, {passive:false});
+      dom.addEventListener('contextmenu', e => e.preventDefault());
+    }
+    update(){
+      // damping interpolation
+      this.spherical.radius += (this.targetRadius - this.spherical.radius) * (this.enableDamping ? this.dampingFactor*4 : 1);
+      this.spherical.theta += (this.targetSpherical.theta - this.spherical.theta) * (this.enableDamping ? this.dampingFactor*4 : 1);
+      this.spherical.phi += (this.targetSpherical.phi - this.spherical.phi) * (this.enableDamping ? this.dampingFactor*4 : 1);
+      const pos = new THREE.Vector3().setFromSpherical(this.spherical).add(this.target);
+      this.camera.position.copy(pos);
+      this.camera.lookAt(this.target);
+    }
+    dispose(){
+      this.dom.removeEventListener('pointerdown', this._down);
+      window.removeEventListener('pointermove', this._move);
+      window.removeEventListener('pointerup', this._up);
+      this.dom.removeEventListener('wheel', this._wheel);
+    }
+  }
+
+  // --- Scene + renderer (performance tuned) ---
   const container = document.getElementById('wrap');
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b0b0b);
 
   const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 200);
   camera.position.set(6,6,6);
-  camera.lookAt(0,0,0);
 
-  const renderer = new THREE.WebGLRenderer({ antialias:true });
-  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  const renderer = new THREE.WebGLRenderer({ antialias:false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
   renderer.setSize(container.clientWidth, container.clientHeight);
   container.appendChild(renderer.domElement);
 
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.08;
-  controls.target.set(0,0,0);
+  const controls = new SimpleControls(camera, renderer.domElement);
 
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x111111, 0.9);
-  scene.add(hemi);
-  const dir = new THREE.DirectionalLight(0xffffff, 0.6);
-  dir.position.set(5,10,7);
-  scene.add(dir);
+  // light minimal (we use MeshBasicMaterial so lighting isn't required)
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x111111, 0.4); scene.add(hemi);
 
-  const grid = new THREE.GridHelper(14, 14, 0x222222, 0x111111);
-  grid.material.opacity = 0.06;
-  grid.material.transparent = true;
-  scene.add(grid);
-
-  const GAP = 0.06;
+  // --- Cube parameters (global for helper functions) ---
+  let GAP = 0.04;
   const CUBELET_SIZE = 0.98;
-  const SPACING = CUBELET_SIZE + GAP;
+  let SPACING = CUBELET_SIZE + GAP;
   const positions = [-1,0,1];
-  const cubelets = [];
-  const cubeGroup = new THREE.Group();
-  scene.add(cubeGroup);
 
+  // We'll recreate the cube on reset to avoid orphan/parent transform artifacts
+  let cubeGroup = null;
+  let cubelets = [];
+
+  // Colors
   const COLORS = {
-    U: 0xffffff,  // White - top
-    D: 0xffff00,  // Yellow - bottom
-    F: 0x00ff00,  // Green - front
-    B: 0x0066ff,  // Blue - back
-    R: 0xff0000,  // Red - right
-    L: 0xff8800,  // Orange - left
-    NONE: 0x1a1a1a
+    U: 0xffffff, D: 0xffff00, F: 0x00a000, B: 0x0033aa, R: 0xff0000, L: 0xff8c00, NONE: 0x111111
   };
 
-  function faceColorForCubelet(x,y,z) {
+  function faceColorForCubelet(x,y,z){
     return [
-      x === 1 ? COLORS.R : COLORS.NONE,
-      x === -1 ? COLORS.L : COLORS.NONE,
-      y === 1 ? COLORS.U : COLORS.NONE,
-      y === -1 ? COLORS.D : COLORS.NONE,
-      z === 1 ? COLORS.F : COLORS.NONE,
-      z === -1 ? COLORS.B : COLORS.NONE
+      x===1 ? COLORS.R : COLORS.NONE,  // +X right
+      x===-1 ? COLORS.L : COLORS.NONE, // -X left
+      y===1 ? COLORS.U : COLORS.NONE,  // +Y top
+      y===-1 ? COLORS.D : COLORS.NONE, // -Y bottom
+      z===1 ? COLORS.F : COLORS.NONE,  // +Z front
+      z===-1 ? COLORS.B : COLORS.NONE  // -Z back
     ];
   }
 
-  const geom = new THREE.BoxGeometry(CUBELET_SIZE, CUBELET_SIZE, CUBELET_SIZE);
-  for (let xi of positions) {
-    for (let yi of positions) {
-      for (let zi of positions) {
-        const mats = faceColorForCubelet(xi, yi, zi).map(c => new THREE.MeshStandardMaterial({
-          color: c,
-          metalness: 0.05,
-          roughness: 0.35
-        }));
-        const mesh = new THREE.Mesh(geom, mats);
-        mesh.position.set(xi*SPACING, yi*SPACING, zi*SPACING);
-        mesh.userData = { coords: { x:xi, y:yi, z:zi } };
-        cubeGroup.add(mesh);
-        cubelets.push(mesh);
-      }
+  // create cube fresh
+  function buildCube(){
+    // remove previous
+    if (cubeGroup) {
+      scene.remove(cubeGroup);
+      cubeGroup.traverse(obj => {
+        if (obj.isMesh) obj.geometry.dispose();
+      });
     }
+    cubeGroup = new THREE.Group();
+    scene.add(cubeGroup);
+    cubelets = [];
+
+    const geom = new THREE.BoxGeometry(CUBELET_SIZE, CUBELET_SIZE, CUBELET_SIZE);
+    for (let xi of positions) for (let yi of positions) for (let zi of positions){
+      const mats = faceColorForCubelet(xi, yi, zi).map(c => new THREE.MeshBasicMaterial({ color: c }));
+      // create mesh with an *array* of materials (6) so faces correspond correctly
+      const mesh = new THREE.Mesh(geom, mats);
+      mesh.position.set(xi*SPACING, yi*SPACING, zi*SPACING);
+      mesh.userData = { coords: { x:xi, y:yi, z:zi } };
+      cubeGroup.add(mesh);
+      cubelets.push(mesh);
+    }
+    // ensure everything snapped
+    cubelets.forEach(c => snapCubelet(c));
   }
 
-  const movesListNode = document.getElementById('movesList');
-  function updateMoveListUI(){
-    if (!recordedMoves.length) { movesListNode.textContent = "(none)"; return; }
-    movesListNode.innerHTML = recordedMoves.map((m,i)=> (i+1)+': '+m ).join('<br>');
+  // helper: snap position/quaternion to exact grid
+  function snapCubelet(mesh){
+    const x = Math.round(mesh.position.x / SPACING);
+    const y = Math.round(mesh.position.y / SPACING);
+    const z = Math.round(mesh.position.z / SPACING);
+    mesh.position.set(x*SPACING, y*SPACING, z*SPACING);
+    mesh.userData.coords = { x,y,z };
+    const e = new THREE.Euler().setFromQuaternion(mesh.quaternion, "XYZ");
+    function snapAngle(a){ return THREE.MathUtils.degToRad(Math.round(THREE.MathUtils.radToDeg(a)/90)*90); }
+    e.x = snapAngle(e.x); e.y = snapAngle(e.y); e.z = snapAngle(e.z);
+    mesh.quaternion.setFromEuler(e);
+    mesh.updateMatrix(); mesh.updateMatrixWorld(true);
   }
 
-  let recordedMoves = [];
-  let moveQueue = [];
-  let busy = false;
+  // initial build
+  buildCube();
 
+  // face definitions for layer selection
   const faceDefs = {
-    U: {axis:'y', layer: 1},
-    D: {axis:'y', layer: -1},
-    L: {axis:'x', layer: -1},
-    R: {axis:'x', layer: 1},
-    F: {axis:'z', layer: 1},
-    B: {axis:'z', layer: -1}
+    U: { axis:'y', layer: 1 },
+    D: { axis:'y', layer: -1 },
+    L: { axis:'x', layer: -1 },
+    R: { axis:'x', layer: 1 },
+    F: { axis:'z', layer: 1 },
+    B: { axis:'z', layer: -1 }
   };
 
-  function enqueueMove(moveStr, record=true){
-    if (record) recordedMoves.push(moveStr);
-    moveQueue.push(moveStr);
-    updateMoveListUI();
-    if (!busy) runQueue();
-  }
-
-  function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  function parseMove(moveStr){
-    const face = moveStr[0];
-    let suffix = moveStr.slice(1);
-    let turns = 1;
-    if (suffix === "2") turns = 2;
-    if (suffix === "'") turns = -1;
-    return { face, turns };
-  }
-
-  function getLayer(face){
-    const def = faceDefs[face];
-    const axis = def.axis;
-    const val = def.layer * SPACING;
-    const eps = SPACING/2 + 0.02;
-    return cubelets.filter(c => Math.abs(c.position[axis] - val) < eps);
-  }
-
+  // --- animation and reparent helper ---
   function reparentPreserveWorld(child, newParent){
     child.updateMatrixWorld(true);
     newParent.updateMatrixWorld(true);
@@ -201,18 +230,22 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     child.updateMatrixWorld(true);
   }
 
-  function snapCubelet(mesh){
-    const x = Math.round(mesh.position.x / SPACING);
-    const y = Math.round(mesh.position.y / SPACING);
-    const z = Math.round(mesh.position.z / SPACING);
-    mesh.position.set(x*SPACING, y*SPACING, z*SPACING);
-    mesh.userData.coords = { x,y,z };
-    const e = new THREE.Euler().setFromQuaternion(mesh.quaternion, "XYZ");
-    function snapAngle(a){ return THREE.MathUtils.degToRad(Math.round(THREE.MathUtils.radToDeg(a)/90)*90); }
-    e.x = snapAngle(e.x); e.y = snapAngle(e.y); e.z = snapAngle(e.z);
-    mesh.quaternion.setFromEuler(e);
-    mesh.updateMatrix();
-    mesh.updateMatrixWorld(true);
+  function getLayer(face){
+    const def = faceDefs[face];
+    const axis = def.axis;
+    const val = def.layer * SPACING;
+    const eps = SPACING/2 + 0.02;
+    return cubelets.filter(c => Math.abs(c.position[axis] - val) < eps);
+  }
+
+  // animate move
+  function parseMove(moveStr){
+    const face = moveStr[0];
+    const suffix = moveStr.slice(1);
+    let turns = 1;
+    if (suffix === "2") turns = 2;
+    if (suffix === "'") turns = -1;
+    return { face, turns };
   }
 
   function animateMove(moveStr){
@@ -221,22 +254,18 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
       const layer = getLayer(face);
       const group = new THREE.Group();
       scene.add(group);
-
       layer.forEach(c => reparentPreserveWorld(c, group));
-
       let axisVec = new THREE.Vector3();
-      if (faceDefs[face].axis === 'x') axisVec.set(1,0,0);
-      if (faceDefs[face].axis === 'y') axisVec.set(0,1,0);
-      if (faceDefs[face].axis === 'z') axisVec.set(0,0,1);
-
+      const axis = faceDefs[face].axis;
+      if (axis === 'x') axisVec.set(1,0,0);
+      if (axis === 'y') axisVec.set(0,1,0);
+      if (axis === 'z') axisVec.set(0,0,1);
       const faceSign = { U:-1, D:1, L:1, R:-1, F:-1, B:1 };
       const sign = faceSign[face] || 1;
       const quarter = Math.PI/2;
       const targetAngle = quarter * Math.abs(turns) * Math.sign(turns) * sign;
-
-      const duration = 200 * Math.abs(turns);
+      const duration = 160 * Math.abs(turns); // quicker for snappiness
       const start = performance.now();
-
       function step(now){
         const t = Math.min(1, (now - start)/duration);
         const eased = t<0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2;
@@ -266,14 +295,36 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     });
   }
 
+  // --- bookkeeping for moves + queue ---
+  const movesListNode = document.getElementById('movesList');
+  function updateMoveListUI(){
+    if (!recordedMoves.length){ movesListNode.textContent = "(none)"; return; }
+    movesListNode.innerHTML = recordedMoves.map((m,i)=> (i+1)+': '+m ).join('<br>');
+  }
+  let recordedMoves = [];
+  let moveQueue = [];
+  let busy = false;
+
   async function runQueue(){
     busy = true;
     while (moveQueue.length){
       const m = moveQueue.shift();
-      await animateMove(m);
-      await wait(80);
+      try { await animateMove(m); } catch(e){ console.warn('animate error', e); }
+      // slight pause between moves
+      await new Promise(r => setTimeout(r, 60));
     }
     busy = false;
+  }
+
+  function enqueueMove(moveStr, record=true){
+    if (record) {
+      recordedMoves.push(moveStr);
+      // mirror to modelCube if present (see the modelCube section)
+      try { if (modelCube) modelCube.move(moveStr); } catch(e) { /* ignore */ }
+    }
+    moveQueue.push(moveStr);
+    updateMoveListUI();
+    if (!busy) runQueue();
   }
 
   function applyMoveString(moveStr, record=true){
@@ -286,16 +337,203 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     return m + "'";
   }
 
-  function scrambleRandom(count=20){
+  // --- Solver integration (cube.js) ---
+  // We will try to detect useful APIs in multiple ways and set solverAvailable accordingly.
+  let modelCube = null;
+  let solverAvailable = false;
+  const solverStateNode = document.getElementById('solverState');
+
+  function initModelCubeDetection(){
+    try {
+      if (typeof Cube === 'undefined') {
+        solverAvailable = false;
+        solverStateNode.textContent = 'no cube.js loaded';
+        console.warn('cube.js not loaded (global Cube missing)');
+        return;
+      }
+      // create a model instance
+      modelCube = new Cube(); // many builds expose this
+      // detect if instance has solve method
+      if (typeof modelCube.solve === 'function') {
+        solverAvailable = true;
+        solverStateNode.textContent = 'solver ready (instance.solve)';
+      } else if (typeof Cube.solve === 'function') {
+        // some variants expose static Cube.solve(...)
+        solverAvailable = true;
+        solverStateNode.textContent = 'solver ready (Cube.solve)';
+      } else {
+        // maybe there is an initSolver/async API but no direct solve - mark incompatible
+        solverAvailable = false;
+        solverStateNode.textContent = 'incompatible cube.js build';
+        console.warn('cube.js loaded but expected solve() API not found. Cube keys:', Object.keys(Cube || {}).slice(0,40));
+      }
+      // try to init solver precomputation if supported
+      try {
+        if (typeof Cube.initSolver === 'function') {
+          solverStateNode.textContent = 'initializing solver...';
+          Cube.initSolver();
+          solverStateNode.textContent = 'solver ready (init done)';
+          solverAvailable = true;
+        }
+      } catch (e) {
+        // nonfatal
+        console.warn('Cube.initSolver failed (nonfatal):', e);
+      }
+    } catch (ex) {
+      solverAvailable = false;
+      solverStateNode.textContent = 'init error';
+      console.warn('initModelCubeDetection error', ex);
+    }
+  }
+  initModelCubeDetection();
+
+  // fallback solver: reverse recorded moves (works only if cube was scrambled using UI)
+  function fallbackSolveByRecordedMoves(){
+    if (!recordedMoves.length) {
+      solverStateNode.textContent = 'nothing to invert';
+      return;
+    }
+    const snapshot = recordedMoves.slice();
+    const reversed = snapshot.slice().reverse().map(invertMove);
+    // clear recorded moves (we're executing the reverse)
+    recordedMoves = [];
+    updateMoveListUI();
+    reversed.forEach(m => moveQueue.push(m));
+    if (!busy) runQueue();
+  }
+
+  // primary solve function (tries real solver then fallback)
+  async function solve(){
+    if (busy) return;
+    // If solver present, try to compute solution from modelCube
+    if (solverAvailable && modelCube) {
+      solverStateNode.textContent = 'solving (real solver)...';
+      try {
+        let solution = null;
+        if (typeof modelCube.solve === 'function') {
+          solution = modelCube.solve();
+        } else if (typeof Cube.solve === 'function') {
+          solution = Cube.solve(modelCube);
+        }
+        if (!solution || !solution.trim()) {
+          solverStateNode.textContent = 'already solved';
+          return;
+        }
+        solverStateNode.textContent = 'solution computed';
+        const tokens = solution.trim().split(/\s+/);
+        tokens.forEach(tok => moveQueue.push(tok));
+        updateMoveListUI();
+        if (!busy) runQueue();
+        return;
+      } catch (ex){
+        console.warn('real solver error, falling back to recorded inverse', ex);
+        solverStateNode.textContent = 'solver error, using fallback';
+        fallbackSolveByRecordedMoves();
+        return;
+      }
+    }
+    // No solver available -> fallback to reverse recorded moves
+    solverStateNode.textContent = 'no solver -> reversing recorded moves';
+    fallbackSolveByRecordedMoves();
+  }
+
+  // Read visual state: sample materials colors, build facelet string and load into modelCube (if cube.js compatible)
+  function readVisualStateIntoModel(){
+    if (typeof Cube === 'undefined') { showError('cube.js not loaded (cannot read visual state for solver)'); return; }
+    // mapping numeric hex -> face letter heuristic
+    function hexToFace(hex){
+      const map = [{f:'U',h:COLORS.U},{f:'D',h:COLORS.D},{f:'F',h:COLORS.F},{f:'B',h:COLORS.B},{f:'R',h:COLORS.R},{f:'L',h:COLORS.L}];
+      for (let m of map) if (m.h === hex) return m.f;
+      // fallback nearest by numeric difference
+      let best=null, bestDiff=1e12;
+      for (let m of map){ const d = Math.abs(m.h - hex); if (d < bestDiff){ best=m.f; bestDiff=d; } }
+      return best || 'U';
+    }
+    // facelet sample coordinates same as earlier code
+    const faceletCenters = {
+      U: [ [-1,1,-1],[0,1,-1],[1,1,-1],[-1,1,0],[0,1,0],[1,1,0],[-1,1,1],[0,1,1],[1,1,1] ],
+      R: [ [1,1,-1],[1,1,0],[1,1,1],[1,0,-1],[1,0,0],[1,0,1],[1,-1,-1],[1,-1,0],[1,-1,1] ],
+      F: [ [-1,1,1],[0,1,1],[1,1,1],[-1,0,1],[0,0,1],[1,0,1],[-1,-1,1],[0,-1,1],[1,-1,1] ],
+      D: [ [-1,-1,1],[0,-1,1],[1,-1,1],[-1,-1,0],[0,-1,0],[1,-1,0],[-1,-1,-1],[0,-1,-1],[1,-1,-1] ],
+      L: [ [-1,1,1],[-1,1,0],[-1,1,-1],[-1,0,1],[-1,0,0],[-1,0,-1],[-1,-1,1],[-1,-1,0],[-1,-1,-1] ],
+      B: [ [1,1,-1],[0,1,-1],[-1,1,-1],[1,0,-1],[0,0,-1],[-1,0,-1],[1,-1,-1],[0,-1,-1],[-1,-1,-1] ]
+    };
+    function getCubeletAt(x,y,z){
+      return cubelets.find(c => {
+        const cx = Math.round(c.position.x / SPACING);
+        const cy = Math.round(c.position.y / SPACING);
+        const cz = Math.round(c.position.z / SPACING);
+        return cx === x && cy === y && cz === z;
+      });
+    }
+    const faceToIndex = { R:0, L:1, U:2, D:3, F:4, B:5 };
+    const faceOrder = ['U','R','F','D','L','B'];
+    let faceletString = '';
+    for (let f of faceOrder){
+      for (let pos of faceletCenters[f]){
+        const [x,y,z] = pos;
+        const c = getCubeletAt(x,y,z);
+        if (!c) { faceletString += f; continue; }
+        const mi = faceToIndex[f];
+        const mat = c.material[mi];
+        const hex = mat && mat.color ? mat.color.getHex() : null;
+        if (!hex) { faceletString += f; continue; }
+        faceletString += hexToFace(hex);
+      }
+    }
+
+    try {
+      // Attempt to load faceletString into modelCube using several possible APIs
+      if (!modelCube) modelCube = new Cube();
+      if (typeof modelCube.fromString === 'function') {
+        modelCube.fromString(faceletString);
+      } else if (typeof Cube.fromString === 'function') {
+        const temp = new Cube();
+        Cube.fromString(faceletString, temp);
+        modelCube = temp;
+      } else if (typeof Cube.init === 'function') {
+        // some builds accept Cube.init(faceletString) semantics
+        modelCube = new Cube(faceletString);
+      } else {
+        showError('cube.js: cannot load facelet string into model (incompatible cube.js build).');
+        return;
+      }
+      // visual -> model mapping succeeded
+      recordedMoves = [];
+      moveQueue = [];
+      updateMoveListUI();
+      solverStateNode.textContent = 'visual state loaded';
+      // re-detect solver if previously incompatible
+      initModelCubeDetection();
+    } catch (e){
+      showError('Failed to parse visual state: ' + e);
+    }
+  }
+
+  // --- Reset: rebuild entire cube (fixes weird leftover transforms) ---
+  function resetCubeInstant(){
+    // clear queues + recorded moves
+    moveQueue = [];
+    recordedMoves = [];
+    updateMoveListUI();
+    // recreate the cube entirely
+    buildCube();
+    // reset modelCube if available
+    try { modelCube = new Cube(); } catch(e) { /* ignore */ }
+  }
+
+  // --- scramble + random move helpers ---
+  function scrambleRandom(count = 20){
     if (busy) return;
     recordedMoves = [];
     moveQueue = [];
+    if (modelCube) modelCube = new Cube();
     const choices = ['U','D','L','R','F','B'];
     let last = null;
     const seq = [];
     for (let i=0;i<count;i++){
       let face = choices[Math.floor(Math.random()*choices.length)];
-      if (face === last){ i--; continue; }
+      if (face === last) { i--; continue; }
       last = face;
       const r = Math.random();
       let suffix = "";
@@ -304,31 +542,6 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
       seq.push(face + suffix);
     }
     seq.forEach(m => enqueueMove(m, true));
-  }
-
-  function solve(){
-    if (busy) return;
-    if (!recordedMoves.length) return;
-    const snapshot = recordedMoves.slice();
-    const reversed = snapshot.slice().reverse().map(invertMove);
-    recordedMoves = [];
-    updateMoveListUI();
-    reversed.forEach(m => moveQueue.push(m));
-    runQueue();
-  }
-
-  function resetCubeInstant(){
-    moveQueue = [];
-    recordedMoves = [];
-    updateMoveListUI();
-    cubelets.forEach(c => {
-      const coords = c.userData.coords;
-      c.position.set(coords.x * SPACING, coords.y * SPACING, coords.z * SPACING);
-      c.rotation.set(0,0,0);
-      c.quaternion.set(0,0,0,1);
-      snapCubelet(c);
-      if (c.parent !== cubeGroup) cubeGroup.add(c);
-    });
   }
 
   function randomSingleMove(){
@@ -341,11 +554,14 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     applyMoveString(f + suffix, true);
   }
 
+  // wire UI
   document.getElementById('scrambleBtn').addEventListener('click', ()=> scrambleRandom(20));
   document.getElementById('solveBtn').addEventListener('click', ()=> solve());
   document.getElementById('randBtn').addEventListener('click', ()=> randomSingleMove());
   document.getElementById('resetBtn').addEventListener('click', ()=> { if (!busy) resetCubeInstant(); });
+  document.getElementById('scanBtn').addEventListener('click', ()=> readVisualStateIntoModel());
 
+  // keyboard shortcuts
   window.addEventListener('keydown', (e) => {
     const key = e.key.toUpperCase();
     if (['U','D','L','R','F','B'].includes(key)){
@@ -358,6 +574,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     if (e.key.toLowerCase() === 's'){ solve(); }
   });
 
+  // --- render loop ---
   function animate(){
     requestAnimationFrame(animate);
     controls.update();
@@ -365,11 +582,13 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
   }
   animate();
 
+  // final snap and UI init
   cubelets.forEach(c => snapCubelet(c));
   updateMoveListUI();
+  console.log('Rubik page ready. Solver available?', solverAvailable, 'ModelCube exists?', !!modelCube);
+  console.log('If you still see "Solver API not found" in the red box: cube.js build loaded but lacks solve() -> fallback will be used.');
 
-  console.log("Rubik's cube ready. Use Scramble -> Solve. Keyboard: U D L R F B (Shift for prime, Alt/2 for double). Space = scramble, S = solve.");
-  
+  // responsive
   window.addEventListener('resize', ()=> {
     camera.aspect = container.clientWidth / container.clientHeight;
     camera.updateProjectionMatrix();
